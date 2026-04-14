@@ -1511,9 +1511,10 @@ class Backtest:
                     SharedMemoryManager() as smm:
                 with patch(self, '_data', None):
                     bt = copy(self)  # bt._data will be reassigned in _mp_task worker
+                data_shm = smm.df2shm(self._data)
                 results = _tqdm(
                     pool.imap(Backtest._mp_task,
-                              ((bt, smm.df2shm(self._data), params_batch)
+                              ((bt, data_shm, params_batch)
                                for params_batch in _batch(param_combos))),
                     total=len(param_combos),
                     desc='Backtest.optimize'
