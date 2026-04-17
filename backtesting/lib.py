@@ -13,6 +13,7 @@ Please raise ideas for additions to this collection on the [issue tracker].
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections import OrderedDict
 from inspect import currentframe
@@ -583,25 +584,66 @@ class MultiBacktest:
         self._strategy = strategy_cls
         self._bt_kwargs = kwargs
 
+    # Cap on DataFrames whose POSIX shared-memory segments are held open
+    # simultaneously when using a process-based pool. macOS POSIX shm limits
+    # are very tight (see `sysctl kern.sysv.shmseg|shmmni`) and leaked
+    # segments persist across crashes until reboot, so we keep peak usage
+    # well bounded. Override via env var BACKTESTING_SHM_BATCH if needed.
+    _SHM_BATCH_CAP = int(os.environ.get('BACKTESTING_SHM_BATCH', '24'))
+
     def run(self, **kwargs):
         """
         Wraps `backtesting.backtesting.Backtest.run`. Returns `pd.DataFrame` with
         currency indexes in columns.
         """
+        # When the pool is thread-based (e.g. macOS spawn fallback to
+        # multiprocessing.dummy.Pool), skip POSIX shared memory entirely --
+        # threads share memory natively, and `shm_open` on macOS hits hard
+        # system limits well before our DataFrame counts. When the pool is
+        # process-based, allocate shm in bounded chunks instead of all at
+        # once to keep peak FD usage low. The original implementation
+        # allocated one segment per column per DataFrame upfront which
+        # exhausts macOS POSIX shm pools and leaks segments on crash.
         from . import Pool
+        from multiprocessing.pool import ThreadPool
         with Pool() as pool, \
-                SharedMemoryManager() as smm:
-            shm = [smm.df2shm(df) for df in self._dfs]
-            results = _tqdm(
-                pool.imap(self._mp_task_run,
-                          ((df_batch, self._strategy, self._bt_kwargs, kwargs)
-                           for df_batch in _batch(shm))),
-                total=len(shm),
-                desc=self.run.__qualname__,
-                mininterval=2
-            )
-            df = pd.DataFrame(list(chain(*results))).transpose()
+                _tqdm(total=len(self._dfs),
+                      desc=self.run.__qualname__,
+                      mininterval=2) as pbar:
+            if isinstance(pool, ThreadPool):
+                results_iter = pool.imap(
+                    self._thread_task_run,
+                    ((df, self._strategy, self._bt_kwargs, kwargs)
+                     for df in self._dfs),
+                )
+                all_results = []
+                for stats in results_iter:
+                    all_results.append(stats)
+                    pbar.update(1)
+            else:
+                cap = max(1, self._SHM_BATCH_CAP)
+                chunks = [self._dfs[i:i + cap]
+                          for i in range(0, len(self._dfs), cap)]
+                all_results = []
+                for chunk in chunks:
+                    with SharedMemoryManager() as smm:
+                        shm = [smm.df2shm(df) for df in chunk]
+                        chunk_results = list(pool.imap(
+                            self._mp_task_run,
+                            ((sub_shm, self._strategy, self._bt_kwargs,
+                              kwargs)
+                             for sub_shm in _batch(shm)),
+                        ))
+                        all_results.extend(chain(*chunk_results))
+                        pbar.update(len(chunk))
+        df = pd.DataFrame(all_results).transpose()
         return df
+
+    @staticmethod
+    def _thread_task_run(args):
+        df, strategy, bt_kwargs, run_kwargs = args
+        stats = Backtest(df, strategy, **bt_kwargs).run(**run_kwargs)
+        return stats.filter(regex='^[^_]')
 
     @staticmethod
     def _mp_task_run(args):
