@@ -13,12 +13,10 @@ Please raise ideas for additions to this collection on the [issue tracker].
 
 from __future__ import annotations
 
-import os
-import warnings
 from collections import OrderedDict
 from collections.abc import Callable, Generator, Sequence
 from inspect import currentframe
-from itertools import chain, compress, count
+from itertools import compress
 from numbers import Number
 from typing import Union
 
@@ -27,8 +25,14 @@ import pandas as pd
 
 from ._plotting import plot_heatmaps as _plot_heatmaps
 from ._stats import compute_stats as _compute_stats
-from ._util import SharedMemoryManager, _Array, _as_str, _batch, _tqdm, patch
-from .backtesting import Backtest, Strategy
+from ._util import _Array, _as_str
+from .backtesting import Strategy
+
+# Re-exported for backward compatibility (`from backtesting.lib import ...`).
+from .fractional_backtest import FractionalBacktest
+from .multi_backtest import MultiBacktest
+from .signal_strategy import SignalStrategy
+from .trailing_strategy import TrailingStrategy
 
 __pdoc__ = {}
 
@@ -414,338 +418,10 @@ def random_ohlc_data(
         yield df
 
 
-class SignalStrategy(Strategy):
-    """
-    A simple helper strategy that operates on position entry/exit signals.
-    This makes the backtest of the strategy simulate a [vectorized backtest].
-    See [tutorials] for usage examples.
-
-    [vectorized backtest]: https://www.google.com/search?q=vectorized+backtest
-    [tutorials]: index.html#tutorials
-
-    To use this helper strategy, subclass it, override its
-    `backtesting.backtesting.Strategy.init` method,
-    and set the signal vector by calling
-    `backtesting.lib.SignalStrategy.set_signal` method from within it.
-
-        class ExampleStrategy(SignalStrategy):
-            def init(self):
-                super().init()
-                self.set_signal(sma1 > sma2, sma1 < sma2)
-
-    Remember to call `super().init()` and `super().next()` in your
-    overridden methods.
-    """
-
-    __entry_signal = (0,)
-    __exit_signal = (False,)
-
-    def set_signal(
-        self,
-        entry_size: Sequence[float],
-        exit_portion: Sequence[float] | None = None,
-        *,
-        plot: bool = True,
-    ):
-        """
-        Set entry/exit signal vectors (arrays).
-
-        A long entry signal is considered present wherever `entry_size`
-        is greater than zero, and a short signal wherever `entry_size`
-        is less than zero, following `backtesting.backtesting.Order.size` semantics.
-
-        If `exit_portion` is provided, a nonzero value closes portion the position
-        (see `backtesting.backtesting.Trade.close()`) in the respective direction
-        (positive values close long trades, negative short).
-
-        If `plot` is `True`, the signal entry/exit indicators are plotted when
-        `backtesting.backtesting.Backtest.plot` is called.
-        """
-        self.__entry_signal = self.I(  # type: ignore
-            lambda: pd.Series(entry_size, dtype=float).replace(0, np.nan),
-            name="entry size",
-            plot=plot,
-            overlay=False,
-            scatter=True,
-            color="black",
-        )
-
-        if exit_portion is not None:
-            self.__exit_signal = self.I(  # type: ignore
-                lambda: pd.Series(exit_portion, dtype=float).replace(0, np.nan),
-                name="exit portion",
-                plot=plot,
-                overlay=False,
-                scatter=True,
-                color="black",
-            )
-
-    def next(self):
-        super().next()
-
-        exit_portion = self.__exit_signal[-1]
-        if exit_portion > 0:
-            for trade in self.trades:
-                if trade.is_long:
-                    trade.close(exit_portion)
-        elif exit_portion < 0:
-            for trade in self.trades:
-                if trade.is_short:
-                    trade.close(-exit_portion)
-
-        entry_size = self.__entry_signal[-1]
-        if entry_size > 0:
-            self.buy(size=entry_size)
-        elif entry_size < 0:
-            self.sell(size=-entry_size)
-
-
-class TrailingStrategy(Strategy):
-    """
-    A strategy with automatic trailing stop-loss, trailing the current
-    price at distance of some multiple of average true range (ATR). Call
-    `TrailingStrategy.set_trailing_sl()` to set said multiple
-    (`6` by default). See [tutorials] for usage examples.
-
-    [tutorials]: index.html#tutorials
-
-    Remember to call `super().init()` and `super().next()` in your
-    overridden methods.
-    """
-
-    __n_atr = 6.0
-    __atr = None
-
-    def init(self):
-        super().init()
-        self.set_atr_periods()
-
-    def set_atr_periods(self, periods: int = 100):
-        """
-        Set the lookback period for computing ATR. The default value
-        of 100 ensures a _stable_ ATR.
-        """
-        hi, lo, c_prev = self.data.High, self.data.Low, pd.Series(self.data.Close).shift(1)
-        tr = np.max([hi - lo, (c_prev - hi).abs(), (c_prev - lo).abs()], axis=0)
-        atr = pd.Series(tr).rolling(periods).mean().bfill().values  # type: ignore[attr-defined]
-        self.__atr = atr
-
-    def set_trailing_sl(self, n_atr: float = 6):
-        """
-        Set the future trailing stop-loss as some multiple (`n_atr`)
-        average true bar ranges away from the current price.
-        """
-        self.__n_atr = n_atr
-
-    def set_trailing_pct(self, pct: float = 0.05):
-        """
-        Set the future trailing stop-loss as some percent (`0 < pct < 1`)
-        below the current price (default 5% below).
-
-        .. note:: Stop-loss set by `pct` is inexact
-            Stop-loss set by `set_trailing_pct` is converted to units of ATR
-            with `mean(Close * pct / atr)` and set with `set_trailing_sl`.
-        """
-        assert 0 < pct < 1, "Need pct= as rate, i.e. 5% == 0.05"
-        pct_in_atr = float(np.mean(self.data.Close * pct / self.__atr))  # type: ignore
-        self.set_trailing_sl(pct_in_atr)
-
-    def next(self):
-        super().next()
-        # Can't use index=-1 because self.__atr is not an Indicator type
-        assert self.__atr is not None, "call set_atr_periods() before next()"
-        index = len(self.data) - 1
-        for trade in self.trades:
-            if trade.is_long:
-                trade.sl = max(
-                    trade.sl or -np.inf, self.data.Close[index] - self.__atr[index] * self.__n_atr
-                )
-            else:
-                trade.sl = min(
-                    trade.sl or np.inf, self.data.Close[index] + self.__atr[index] * self.__n_atr
-                )
-
-
-class FractionalBacktest(Backtest):
-    """
-    A `backtesting.backtesting.Backtest` that supports fractional share trading
-    by simple composition. It applies roughly the transformation:
-
-        data = (data * fractional_unit).assign(Volume=data.Volume / fractional_unit)
-
-    as left unchallenged in [this FAQ entry on GitHub](https://github.com/kernc/backtesting.py/issues/134),
-    then passes `data`, `args*`, and `**kwargs` to its super.
-
-    Parameter `fractional_unit` represents the smallest fraction of currency that can be traded
-    and defaults to one [satoshi]. For μBTC trading, pass `fractional_unit=1/1e6`.
-    Thus-transformed backtest does a whole-sized trading of `fractional_unit` units.
-
-    [satoshi]: https://en.wikipedia.org/wiki/Bitcoin#Units_and_divisibility
-    """
-
-    def __init__(self, data, *args, fractional_unit=1 / 100e6, **kwargs):
-        if "satoshi" in kwargs:
-            warnings.warn(
-                "Parameter `FractionalBacktest(..., satoshi=)` is deprecated. "
-                "Use `FractionalBacktest(..., fractional_unit=)`.",
-                category=DeprecationWarning,
-                stacklevel=2,
-            )
-            fractional_unit = 1 / kwargs.pop("satoshi")
-        self._fractional_unit = fractional_unit
-        self.__data: pd.DataFrame = data.copy(deep=False)  # Shallow copy
-        for col in (
-            "Open",
-            "High",
-            "Low",
-            "Close",
-        ):
-            self.__data[col] = self.__data[col] * self._fractional_unit
-        for col in ("Volume",):
-            self.__data[col] = self.__data[col] / self._fractional_unit
-        with warnings.catch_warnings(record=True):
-            warnings.filterwarnings(action="ignore", message="frac")
-            super().__init__(data, *args, **kwargs)
-
-    def run(self, **kwargs) -> pd.Series:
-        with patch(self, "_data", self.__data):
-            result = super().run(**kwargs)
-
-        trades: pd.DataFrame = result["_trades"]  # type: ignore[assignment]
-        trades["Size"] *= self._fractional_unit
-        trades[["EntryPrice", "ExitPrice", "TP", "SL"]] /= self._fractional_unit
-
-        indicators = result["_strategy"]._indicators  # type: ignore[attr-defined]
-        for indicator in indicators:
-            if indicator._opts["overlay"]:
-                indicator /= self._fractional_unit
-
-        return result
-
-
 # Prevent pdoc3 documenting __init__ signature of Strategy subclasses
 for cls in list(globals().values()):
     if isinstance(cls, type) and issubclass(cls, Strategy):
         __pdoc__[f"{cls.__name__}.__init__"] = False
-
-
-class MultiBacktest:
-    """
-    Multi-dataset `backtesting.backtesting.Backtest` wrapper.
-
-    Run supplied `backtesting.backtesting.Strategy` on several instruments,
-    in parallel.  Used for comparing strategy runs across many instruments
-    or classes of instruments. Example:
-
-        from backtesting.test import EURUSD, BTCUSD, SmaCross
-        btm = MultiBacktest([EURUSD, BTCUSD], SmaCross)
-        stats_per_ticker: pd.DataFrame = btm.run(fast=10, slow=20)
-        heatmap_per_ticker: pd.DataFrame = btm.optimize(...)
-    """
-
-    def __init__(self, df_list, strategy_cls: type[Strategy], **kwargs):
-        self._dfs = df_list
-        self._strategy = strategy_cls
-        self._bt_kwargs = kwargs
-
-    # Cap on DataFrames whose POSIX shared-memory segments are held open
-    # simultaneously when using a process-based pool. macOS POSIX shm limits
-    # are very tight (see `sysctl kern.sysv.shmseg|shmmni`) and leaked
-    # segments persist across crashes until reboot, so we keep peak usage
-    # well bounded. Override via env var BACKTESTING_SHM_BATCH if needed.
-    _SHM_BATCH_CAP = int(os.environ.get("BACKTESTING_SHM_BATCH", "24"))
-
-    def run(self, **kwargs):
-        """
-        Wraps `backtesting.backtesting.Backtest.run`. Returns `pd.DataFrame` with
-        currency indexes in columns.
-        """
-        # When the pool is thread-based (e.g. macOS spawn fallback to
-        # multiprocessing.dummy.Pool), skip POSIX shared memory entirely --
-        # threads share memory natively, and `shm_open` on macOS hits hard
-        # system limits well before our DataFrame counts. When the pool is
-        # process-based, allocate shm in bounded chunks instead of all at
-        # once to keep peak FD usage low. The original implementation
-        # allocated one segment per column per DataFrame upfront which
-        # exhausts macOS POSIX shm pools and leaks segments on crash.
-        from multiprocessing.pool import ThreadPool
-
-        from . import Pool
-
-        with (
-            Pool() as pool,
-            _tqdm(  # type: ignore[call-arg]
-                total=len(self._dfs), desc=self.run.__qualname__, mininterval=2
-            ) as pbar,
-        ):
-            if isinstance(pool, ThreadPool):
-                results_iter = pool.imap(
-                    self._thread_task_run,
-                    ((df, self._strategy, self._bt_kwargs, kwargs) for df in self._dfs),
-                )
-                all_results = []
-                for stats in results_iter:
-                    all_results.append(stats)
-                    pbar.update(1)
-            else:
-                cap = max(1, self._SHM_BATCH_CAP)
-                chunks = [self._dfs[i : i + cap] for i in range(0, len(self._dfs), cap)]
-                all_results = []
-                for chunk in chunks:
-                    with SharedMemoryManager() as smm:
-                        shm = [smm.df2shm(df) for df in chunk]
-                        chunk_results = list(
-                            pool.imap(
-                                self._mp_task_run,
-                                (
-                                    (sub_shm, self._strategy, self._bt_kwargs, kwargs)
-                                    for sub_shm in _batch(shm)
-                                ),
-                            )
-                        )
-                        all_results.extend(chain(*chunk_results))
-                        pbar.update(len(chunk))
-        df = pd.DataFrame(all_results).transpose()
-        return df
-
-    @staticmethod
-    def _thread_task_run(args):
-        df, strategy, bt_kwargs, run_kwargs = args
-        stats = Backtest(df, strategy, **bt_kwargs).run(**run_kwargs)
-        return stats.filter(regex="^[^_]")
-
-    @staticmethod
-    def _mp_task_run(args):
-        data_shm, strategy, bt_kwargs, run_kwargs = args
-        dfs, shms = zip(*(SharedMemoryManager.shm2df(i) for i in data_shm), strict=True)
-        try:
-            return [
-                stats.filter(regex="^[^_]")
-                for stats in (Backtest(df, strategy, **bt_kwargs).run(**run_kwargs) for df in dfs)
-            ]
-        finally:
-            for shmem in chain(*shms):
-                shmem.close()
-
-    def optimize(self, **kwargs) -> pd.DataFrame:
-        """
-        Wraps `backtesting.backtesting.Backtest.optimize`, but returns `pd.DataFrame` with
-        currency indexes in columns.
-
-            heamap: pd.DataFrame = btm.optimize(...)
-            from backtesting.plot import plot_heatmaps
-            plot_heatmaps(heatmap.mean(axis=1))
-        """
-        heatmaps = []
-        # Simple loop since bt.optimize already does its own multiprocessing
-        for df in _tqdm(self._dfs, desc=self.__class__.__name__, mininterval=2):
-            bt = Backtest(df, self._strategy, **self._bt_kwargs)
-            _best_stats, heatmap = bt.optimize(  # type: ignore
-                return_heatmap=True, return_optimization=False, **kwargs
-            )
-            heatmaps.append(heatmap)
-        heatmap = pd.DataFrame(dict(zip(count(), heatmaps)))
-        return heatmap
 
 
 # NOTE: Don't put anything below this __all__ list
@@ -762,6 +438,11 @@ __all__ = [  # type: ignore[misc]
         )  # or CONSTANTS
         and not getattr(v, "__name__", k).startswith("_")
     )
-]  # neither marked internal
+] + [  # neither marked internal; classes below are re-exported from sibling modules
+    "FractionalBacktest",
+    "MultiBacktest",
+    "SignalStrategy",
+    "TrailingStrategy",
+]
 
 # NOTE: Don't put anything below here. See above.
