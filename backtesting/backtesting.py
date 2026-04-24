@@ -1682,7 +1682,7 @@ class Backtest:
 
             import cloudpickle
 
-            from .modal_runtime import _resolve_image, run_remote
+            from .remote_executor import default_executor
 
             with patch(self, "_data", None):
                 bt = copy(self)  # _data is rehydrated inline in the worker
@@ -1691,10 +1691,11 @@ class Backtest:
             payloads = [
                 cloudpickle.dumps((_optimize_task, (bt, df, batch))) for batch in batches
             ]
-            image = _resolve_image(self._strategy, self._image)
+            executor = default_executor()
+            image = executor.resolve_image(self._strategy, self._image)
 
             results_iter = _tqdm(
-                run_remote(image, payloads, desc="Backtest.optimize"),
+                executor.run(image, payloads, desc="Backtest.optimize"),
                 total=len(param_combos),
                 desc="Backtest.optimize",
             )

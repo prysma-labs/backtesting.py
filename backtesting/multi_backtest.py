@@ -9,7 +9,6 @@ table.
 from __future__ import annotations
 
 from itertools import count
-from typing import Any, Optional
 
 import cloudpickle
 import modal
@@ -17,7 +16,7 @@ import pandas as pd
 
 from ._util import _tqdm
 from .backtesting import Backtest, Strategy
-from .modal_runtime import _resolve_image, run_remote
+from .remote_executor import default_executor
 
 
 def _run_one(args):
@@ -50,7 +49,7 @@ class MultiBacktest:
         df_list,
         strategy_cls: type[Strategy],
         *,
-        image: Optional[modal.Image] = None,
+        image: modal.Image | None = None,
         **kwargs,
     ):
         self._dfs = df_list
@@ -63,7 +62,8 @@ class MultiBacktest:
         Wraps `backtesting.backtesting.Backtest.run`. Returns `pd.DataFrame` with
         currency indexes in columns.
         """
-        image = _resolve_image(self._strategy, self._image)
+        executor = default_executor()
+        image = executor.resolve_image(self._strategy, self._image)
         payloads = [
             cloudpickle.dumps((_run_one, (df, self._strategy, self._bt_kwargs, kwargs)))
             for df in self._dfs
@@ -73,7 +73,7 @@ class MultiBacktest:
         with _tqdm(  # type: ignore[call-arg]
             total=len(payloads), desc=self.run.__qualname__, mininterval=2
         ) as pbar:
-            for result_bytes in run_remote(image, payloads, desc="MultiBacktest.run"):
+            for result_bytes in executor.run(image, payloads, desc="MultiBacktest.run"):
                 all_results.append(cloudpickle.loads(result_bytes))
                 pbar.update(1)
         return pd.DataFrame(all_results).transpose()
