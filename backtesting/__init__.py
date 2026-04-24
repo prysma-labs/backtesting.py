@@ -68,4 +68,4 @@ except ImportError:
 from . import lib  # noqa: F401
 from ._plotting import set_bokeh_output  # noqa: F401
 from .backtesting import Backtest, Strategy  # noqa: F401
-from .pool import Pool  # noqa: F401
+from .modal_runtime import DEFAULT_IMAGE, configure  # noqa: F401

@@ -1,5 +1,4 @@
 import inspect
-import multiprocessing as mp
 import os
 import sys
 import time
@@ -7,9 +6,17 @@ import unittest
 from concurrent.futures.process import ProcessPoolExecutor
 from contextlib import contextmanager
 from glob import glob
+from pathlib import Path
 from runpy import run_path
 from tempfile import NamedTemporaryFile, gettempdir
 from unittest import TestCase
+
+
+def _modal_available() -> bool:
+    """Modal worker dispatch requires either env-var creds or a local config."""
+    if os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET"):
+        return True
+    return Path.home().joinpath(".modal.toml").exists()
 
 import numpy as np
 import pandas as pd
@@ -965,21 +972,15 @@ class TestLib(TestCase):
         self.assertAlmostEqual(trade['EntryPrice'], 236.69)
         self.assertAlmostEqual(stats['_strategy']._indicators[0][trade['EntryBar']], 234.14)
 
+    @unittest.skipUnless(_modal_available(), "Modal credentials not configured")
     def test_MultiBacktest(self):
-        import backtesting
-        assert callable(getattr(backtesting, 'Pool', None)), backtesting.__dict__
-        for start_method in mp.get_all_start_methods():
-            with self.subTest(start_method=start_method), \
-                    patch(backtesting, 'Pool', mp.get_context(start_method).Pool):
-                start_time = time.monotonic()
-                btm = MultiBacktest([GOOG, EURUSD, BTCUSD], SmaCross, cash=100_000)
-                res = btm.run(fast=2)
-                self.assertIsInstance(res, pd.DataFrame)
-                self.assertEqual(res.columns.tolist(), [0, 1, 2])
-                heatmap = btm.optimize(fast=[2, 4], slow=[10, 20])
-                self.assertIsInstance(heatmap, pd.DataFrame)
-                self.assertEqual(heatmap.columns.tolist(), [0, 1, 2])
-                print(start_method, time.monotonic() - start_time)
+        btm = MultiBacktest([GOOG, EURUSD, BTCUSD], SmaCross, cash=100_000)
+        res = btm.run(fast=2)
+        self.assertIsInstance(res, pd.DataFrame)
+        self.assertEqual(res.columns.tolist(), [0, 1, 2])
+        heatmap = btm.optimize(fast=[2, 4], slow=[10, 20])
+        self.assertIsInstance(heatmap, pd.DataFrame)
+        self.assertEqual(heatmap.columns.tolist(), [0, 1, 2])
         plot_heatmaps(heatmap.mean(axis=1), open_browser=False)
 
 
@@ -1041,13 +1042,11 @@ class TestDocs(TestCase):
     DOCS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'doc')
 
     @unittest.skipUnless(os.path.isdir(DOCS_DIR), "docs dir doesn't exist")
-    @unittest.skipUnless(sys.platform.startswith('linux'), "test_examples requires mp.start_method=fork")
+    @unittest.skipUnless(_modal_available(), "Modal credentials not configured")
     def test_examples(self):
-        import backtesting
         examples = glob(os.path.join(self.DOCS_DIR, 'examples', '*.py'))
         self.assertGreaterEqual(len(examples), 4)
-        with chdir(gettempdir()), \
-                patch(backtesting, 'Pool', mp.get_context('fork').Pool):
+        with chdir(gettempdir()):
             for file in examples:
                 with self.subTest(example=os.path.basename(file)):
                     run_path(file)

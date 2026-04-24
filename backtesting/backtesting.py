@@ -27,7 +27,6 @@ from numpy.random import default_rng
 from ._plotting import plot
 from ._stats import compute_stats, dummy_stats
 from ._util import (
-    SharedMemoryManager,
     _as_str,
     _batch,
     _Data,
@@ -1184,6 +1183,22 @@ class _Broker:
             trade.sl = sl
 
 
+def _optimize_task(arg):
+    """Worker-side task for `Backtest.optimize` grid search.
+
+    Rehydrates the cloudpickled `Backtest` (with its `_data` slot left
+    empty by the caller) by reattaching the inline DataFrame, then runs
+    each parameter set in the batch sequentially and returns the
+    user-facing stats subset.
+    """
+    bt, data, params_batch = arg
+    bt._data = data
+    return [
+        stats.filter(regex="^[^_]") if stats["# Trades"] else None
+        for stats in (bt.run(**params) for params in params_batch)
+    ]
+
+
 class Backtest:
     """
     Backtest a particular (parameterized) strategy
@@ -1282,6 +1297,7 @@ class Backtest:
         hedging=False,
         exclusive_orders=False,
         finalize_trades=False,
+        image=None,
     ):
         if not (isinstance(strategy, type) and issubclass(strategy, Strategy)):
             raise TypeError("`strategy` must be a Strategy sub-type")
@@ -1364,6 +1380,7 @@ class Backtest:
         self._strategy = strategy
         self._results: pd.Series | None = None
         self._finalize_trades = bool(finalize_trades)
+        self._image = image
 
     def run(self, **kwargs) -> pd.Series:
         """
@@ -1663,24 +1680,29 @@ class Backtest:
                 ),
             )
 
-            from . import Pool
+            import cloudpickle
 
-            with Pool() as pool, SharedMemoryManager() as smm:
-                with patch(self, "_data", None):
-                    bt = copy(self)  # bt._data will be reassigned in _mp_task worker
-                data_shm = smm.df2shm(self._data)
-                results = _tqdm(
-                    pool.imap(
-                        Backtest._mp_task,
-                        ((bt, data_shm, params_batch) for params_batch in _batch(param_combos)),
-                    ),
-                    total=len(param_combos),
-                    desc="Backtest.optimize",
-                )
-                for param_batch, result in zip(_batch(param_combos), results, strict=False):
-                    for params, stats in zip(param_batch, result, strict=False):
-                        if stats is not None:
-                            heatmap[tuple(params.values())] = maximize(stats)
+            from .modal_runtime import _resolve_image, run_remote
+
+            with patch(self, "_data", None):
+                bt = copy(self)  # _data is rehydrated inline in the worker
+            df = self._data
+            batches = list(_batch(param_combos))
+            payloads = [
+                cloudpickle.dumps((_optimize_task, (bt, df, batch))) for batch in batches
+            ]
+            image = _resolve_image(self._strategy, self._image)
+
+            results_iter = _tqdm(
+                run_remote(image, payloads, desc="Backtest.optimize"),
+                total=len(param_combos),
+                desc="Backtest.optimize",
+            )
+            for param_batch, result_bytes in zip(batches, results_iter, strict=False):
+                result = cloudpickle.loads(result_bytes)
+                for params, stats in zip(param_batch, result, strict=False):
+                    if stats is not None:
+                        heatmap[tuple(params.values())] = maximize(stats)
 
             if pd.isnull(heatmap).all():
                 # No trade was made in any of the runs. Just make a random
@@ -1788,19 +1810,6 @@ class Backtest:
         else:
             raise ValueError(f"Method should be 'grid' or 'sambo', not {method!r}")
         return output
-
-    @staticmethod
-    def _mp_task(arg):
-        bt, data_shm, params_batch = arg
-        bt._data, shm = SharedMemoryManager.shm2df(data_shm)
-        try:
-            return [
-                stats.filter(regex="^[^_]") if stats["# Trades"] else None
-                for stats in (bt.run(**params) for params in params_batch)
-            ]
-        finally:
-            for shmem in shm:
-                shmem.close()
 
     def plot(
         self,

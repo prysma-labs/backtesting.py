@@ -34,6 +34,8 @@ if __name__ == '__main__':
             'numpy >= 1.17.0',
             'pandas >= 0.25.0, != 0.25.0',
             'bokeh >= 3.0.0, != 3.0.*, != 3.2.*',
+            'modal >= 0.62.0',
+            'cloudpickle >= 3.0.0',
         ],
         extras_require={
             'doc': [
