@@ -87,7 +87,10 @@ def barssince(condition: Sequence[bool], default: float = np.inf) -> int | float
     return next(compress(range(len(condition)), reversed(condition)), default)
 
 
-def cross(series1: Sequence, series2: Sequence) -> bool:
+def cross(
+    series1: Sequence | np.ndarray | pd.Series,
+    series2: Sequence | np.ndarray | pd.Series,
+) -> bool:
     """
     Return `True` if `series1` and `series2` just crossed
     (above or below) each other.
@@ -99,7 +102,10 @@ def cross(series1: Sequence, series2: Sequence) -> bool:
     return crossover(series1, series2) or crossover(series2, series1)
 
 
-def crossover(series1: Sequence, series2: Sequence) -> bool:
+def crossover(
+    series1: Sequence | np.ndarray | pd.Series,
+    series2: Sequence | np.ndarray | pd.Series,
+) -> bool:
     """
     Return `True` if `series1` just crossed over (above)
     `series2`.
